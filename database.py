@@ -7,7 +7,7 @@ def obtener_conexion():
             host="localhost",
             user="root",          
             password="",          
-            database="finca_db", 
+            database="administracion_finca_db", 
             port=3306,            
             cursorclass=pymysql.cursors.Cursor 
         )
