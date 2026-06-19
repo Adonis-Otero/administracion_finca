@@ -6,8 +6,9 @@ def obtener_vacunas_por_especie(id_especie):
     """Retorna las vacunas del catálogo permitidas para una especie particular (Evita errores INSAI)."""
     conexion = obtener_conexion()
     if not conexion: return []
+    import pymysql.cursors
     try:
-        cursor = conexion.cursor(dictionary=True)
+        cursor = conexion.cursor(pymysql.cursors.DictCursor)
         # 1: Bovino, 2: Porcino, 3: Ovino/Caprino (se mapea con catalogo_vacunas)
         query = "SELECT id_vacuna, nombre_enfermedad, dias_retiro FROM catalogo_vacunas WHERE especie_destino = %s;"
         cursor.execute(query, (id_especie,))
@@ -59,8 +60,39 @@ def registrar_vacunacion_lote(lista_id_animales, id_vacuna, nro_lote, lab, vet, 
     except Exception as e:
         conexion.rollback()
         print(f"Error en transacción de vacunas: {e}")
-        return False, "Ocurrió un error al procesar el lote sanitario."
+        return False, f"Ocurrió un error al procesar el lote sanitario: {str(e)}"
     finally:
         conexion.close()
+
+
+def obtener_historial_vacunacion():
+    """Retorna el historial completo de vacunaciones aplicadas en la finca."""
+    conexion = obtener_conexion()
+    if not conexion: 
+        return []
+    try:
+        cursor = conexion.cursor()
+        query = """
+            SELECT rv.id_registro, a.numero_identificacion, cv.nombre_enfermedad, 
+                   DATE_FORMAT(rv.fecha_aplicacion, '%Y-%m-%d'), 
+                   DATE_FORMAT(rv.fecha_proxima_dosis, '%Y-%m-%d'),
+                   lb.numero_lote_comercial, lb.laboratorio, lb.veterinario_responsable
+            FROM registro_vacunacion rv
+            INNER JOIN animales a ON rv.id_animal = a.id_animal
+            INNER JOIN lotes_biologicos lb ON rv.id_lote_bio = lb.id_lote_bio
+            INNER JOIN catalogo_vacunas cv ON lb.id_vacuna = cv.id_vacuna
+            ORDER BY rv.fecha_aplicacion DESC;
+        """
+        cursor.execute(query)
+        resultados = cursor.fetchall()
+        cursor.close()
+        # Convertimos las tuplas a listas para Reflex
+        return [list(fila) for fila in resultados]
+    except Exception as e:
+        print(f"Error al obtener historial de vacunación: {e}")
+        return []
+    finally:
+        conexion.close()
+
 
         
