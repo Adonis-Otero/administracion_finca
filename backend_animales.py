@@ -19,10 +19,15 @@ def obtener_lista_especies():
     finally:
         conexion.close()
 
-def calcular_categoria_insai(id_especie, sexo, fecha_nacimiento_str):
+def calcular_categoria_insai(id_especie, sexo, fecha_nacimiento):
     """Determina automáticamente la categoría zootécnica oficial exigida por el INSAI."""
     try:
-        nacimiento = datetime.datetime.strptime(fecha_nacimiento_str, "%Y-%m-%d").date()
+        if isinstance(fecha_nacimiento, str):
+            nacimiento = datetime.datetime.strptime(fecha_nacimiento, "%Y-%m-%d").date()
+        elif isinstance(fecha_nacimiento, (datetime.date, datetime.datetime)):
+            nacimiento = fecha_nacimiento if isinstance(fecha_nacimiento, datetime.date) else fecha_nacimiento.date()
+        else:
+            return "Maute"
         edad_meses = (datetime.date.today() - nacimiento).days // 30
     except:
         return "Maute"
@@ -141,6 +146,12 @@ def obtener_alertas_sanitarias():
         query = """
             SELECT COUNT(DISTINCT rv.id_animal)
             FROM registro_vacunacion rv
+            INNER JOIN (
+                SELECT id_animal, id_vacuna, MAX(id_registro) as max_id
+                FROM registro_vacunacion r
+                INNER JOIN lotes_biologicos lb ON r.id_lote_bio = lb.id_lote_bio
+                GROUP BY id_animal, id_vacuna
+            ) latest ON rv.id_registro = latest.max_id
             INNER JOIN animales a ON rv.id_animal = a.id_animal
             WHERE a.id_estado = 1 
               AND rv.fecha_proxima_dosis IS NOT NULL 
@@ -158,14 +169,14 @@ def obtener_alertas_sanitarias():
 
 
 def obtener_alertas_produccion():
-    """Retorna la cantidad de animales activos con baja producción (peso bajo o consumo insuficiente)."""
+    """Retorna la cantidad de animales activos con anomalías de producción (peso/alimento bajo o excesivo) según su edad y especie."""
     conexion = obtener_conexion()
     if not conexion:
         return 0
     try:
         cursor = conexion.cursor()
-        # Definimos baja producción como aquellos animales activos que tengan un peso bajo o consumo insuficiente
-        # según su especie, basándonos en el último registro biométrico.
+        # Definimos anomalía de producción como aquellos animales activos que tengan un peso bajo, consumo insuficiente,
+        # o peso y consumo excesivamente elevados (riesgo de sobrealimentación/sobrepeso) según su especie y edad.
         query = """
             SELECT COUNT(DISTINCT a.id_animal)
             FROM animales a
@@ -177,9 +188,23 @@ def obtener_alertas_produccion():
                   WHERE id_animal = a.id_animal
               )
               AND (
-                  (a.id_especie = 1 AND (rb.peso_kg < 150.0 OR rb.consumo_alimento_diario < 2.0)) OR
-                  (a.id_especie = 2 AND (rb.peso_kg < 40.0 OR rb.consumo_alimento_diario < 1.0)) OR
-                  (a.id_especie = 3 AND (rb.peso_kg < 20.0 OR rb.consumo_alimento_diario < 0.5))
+                  -- BOVINO (id_especie = 1)
+                  (a.id_especie = 1 AND (
+                      (TIMESTAMPDIFF(MONTH, a.fecha_nacimiento, CURDATE()) < 12 AND (rb.peso_kg < 70.0 OR rb.consumo_alimento_diario < 1.0 OR rb.peso_kg > 300.0 OR rb.consumo_alimento_diario > 8.0)) OR
+                      (TIMESTAMPDIFF(MONTH, a.fecha_nacimiento, CURDATE()) BETWEEN 12 AND 24 AND (rb.peso_kg < 180.0 OR rb.consumo_alimento_diario < 3.0 OR rb.peso_kg > 450.0 OR rb.consumo_alimento_diario > 12.0)) OR
+                      (TIMESTAMPDIFF(MONTH, a.fecha_nacimiento, CURDATE()) > 24 AND (rb.peso_kg < 350.0 OR rb.consumo_alimento_diario < 5.0 OR rb.peso_kg > 1000.0 OR rb.consumo_alimento_diario > 25.0))
+                  )) OR
+                  -- PORCINO (id_especie = 2)
+                  (a.id_especie = 2 AND (
+                      (TIMESTAMPDIFF(MONTH, a.fecha_nacimiento, CURDATE()) < 3 AND (rb.peso_kg < 10.0 OR rb.consumo_alimento_diario < 0.5 OR rb.peso_kg > 35.0 OR rb.consumo_alimento_diario > 2.0)) OR
+                      (TIMESTAMPDIFF(MONTH, a.fecha_nacimiento, CURDATE()) BETWEEN 3 AND 8 AND (rb.peso_kg < 45.0 OR rb.consumo_alimento_diario < 1.5 OR rb.peso_kg > 130.0 OR rb.consumo_alimento_diario > 4.5)) OR
+                      (TIMESTAMPDIFF(MONTH, a.fecha_nacimiento, CURDATE()) > 8 AND (rb.peso_kg < 90.0 OR rb.consumo_alimento_diario < 2.0 OR rb.peso_kg > 350.0 OR rb.consumo_alimento_diario > 8.0))
+                  )) OR
+                  -- OVINO (id_especie = 3)
+                  (a.id_especie = 3 AND (
+                      (TIMESTAMPDIFF(MONTH, a.fecha_nacimiento, CURDATE()) < 6 AND (rb.peso_kg < 12.0 OR rb.consumo_alimento_diario < 0.4 OR rb.peso_kg > 40.0 OR rb.consumo_alimento_diario > 1.8)) OR
+                      (TIMESTAMPDIFF(MONTH, a.fecha_nacimiento, CURDATE()) >= 6 AND (rb.peso_kg < 30.0 OR rb.consumo_alimento_diario < 0.8 OR rb.peso_kg > 75.0 OR rb.consumo_alimento_diario > 3.0))
+                  ))
               );
         """
         cursor.execute(query)
@@ -191,6 +216,7 @@ def obtener_alertas_produccion():
         return 0
     finally:
         conexion.close()
+
 
 
 def obtener_conteo_por_especie():
@@ -225,7 +251,7 @@ def obtener_conteo_por_especie():
 
 
 def obtener_lista_animales():
-    """Retorna la lista de animales activos con su especie, sexo y categoría INSAI."""
+    """Retorna la lista de animales activos con su especie, sexo y categoría INSAI recalculada dinámicamente."""
     conexion = obtener_conexion()
     if not conexion:
         return []
@@ -233,7 +259,7 @@ def obtener_lista_animales():
         cursor = conexion.cursor()
         query = """
             SELECT a.id_animal, a.numero_identificacion, e.nombre, 
-                   DATE_FORMAT(a.fecha_nacimiento, '%Y-%m-%d'), a.sexo, a.categoria_insai
+                   DATE_FORMAT(a.fecha_nacimiento, '%Y-%m-%d'), a.sexo, a.id_especie
             FROM animales a
             INNER JOIN especies e ON a.id_especie = e.id_especie
             WHERE a.id_estado = 1
@@ -242,8 +268,14 @@ def obtener_lista_animales():
         cursor.execute(query)
         resultados = cursor.fetchall()
         cursor.close()
-        # Convertimos las tuplas a listas para Reflex
-        return [list(fila) for fila in resultados]
+        
+        lista_dinamica = []
+        for fila in resultados:
+            id_animal, numero_identificacion, especie_nombre, fecha_nacimiento_str, sexo, id_especie = fila
+            categoria = calcular_categoria_insai(id_especie, sexo, fecha_nacimiento_str)
+            lista_dinamica.append([id_animal, numero_identificacion, especie_nombre, fecha_nacimiento_str, sexo, categoria])
+            
+        return lista_dinamica
     except Exception as error:
         print(f"Error al obtener lista de animales: {error}")
         return []
@@ -338,5 +370,81 @@ def actualizar_estado_animal(id_animal, nuevo_estado):
         conexion.close()
 
 
+def obtener_codigos_alertas_sanitarias():
+    """Retorna la lista de códigos de identificación de animales activos con vacunas vencidas (alerta sanitaria)."""
+    conexion = obtener_conexion()
+    if not conexion:
+        return []
+    try:
+        cursor = conexion.cursor()
+        query = """
+            SELECT DISTINCT a.numero_identificacion
+            FROM registro_vacunacion rv
+            INNER JOIN (
+                SELECT id_animal, id_vacuna, MAX(id_registro) as max_id
+                FROM registro_vacunacion r
+                INNER JOIN lotes_biologicos lb ON r.id_lote_bio = lb.id_lote_bio
+                GROUP BY id_animal, id_vacuna
+            ) latest ON rv.id_registro = latest.max_id
+            INNER JOIN animales a ON rv.id_animal = a.id_animal
+            WHERE a.id_estado = 1 
+              AND rv.fecha_proxima_dosis IS NOT NULL 
+              AND rv.fecha_proxima_dosis < CURDATE();
+        """
+        cursor.execute(query)
+        resultados = cursor.fetchall()
+        cursor.close()
+        return [fila[0] for fila in resultados]
+    except Exception as error:
+        print(f"Error al obtener códigos de alertas sanitarias: {error}")
+        return []
+    finally:
+        conexion.close()
 
-        
+
+def obtener_codigos_alertas_produccion():
+    """Retorna la lista de códigos de identificación de animales activos con anomalías de producción según su edad y especie."""
+    conexion = obtener_conexion()
+    if not conexion:
+        return []
+    try:
+        cursor = conexion.cursor()
+        query = """
+            SELECT DISTINCT a.numero_identificacion
+            FROM animales a
+            INNER JOIN registros_biometricos rb ON a.id_animal = rb.id_animal
+            WHERE a.id_estado = 1 
+              AND rb.fecha_pesaje = (
+                  SELECT MAX(fecha_pesaje) 
+                  FROM registros_biometricos 
+                  WHERE id_animal = a.id_animal
+              )
+              AND (
+                  -- BOVINO (id_especie = 1)
+                  (a.id_especie = 1 AND (
+                      (TIMESTAMPDIFF(MONTH, a.fecha_nacimiento, CURDATE()) < 12 AND (rb.peso_kg < 70.0 OR rb.consumo_alimento_diario < 1.0 OR rb.peso_kg > 300.0 OR rb.consumo_alimento_diario > 8.0)) OR
+                      (TIMESTAMPDIFF(MONTH, a.fecha_nacimiento, CURDATE()) BETWEEN 12 AND 24 AND (rb.peso_kg < 180.0 OR rb.consumo_alimento_diario < 3.0 OR rb.peso_kg > 450.0 OR rb.consumo_alimento_diario > 12.0)) OR
+                      (TIMESTAMPDIFF(MONTH, a.fecha_nacimiento, CURDATE()) > 24 AND (rb.peso_kg < 350.0 OR rb.consumo_alimento_diario < 5.0 OR rb.peso_kg > 1000.0 OR rb.consumo_alimento_diario > 25.0))
+                  )) OR
+                  -- PORCINO (id_especie = 2)
+                  (a.id_especie = 2 AND (
+                      (TIMESTAMPDIFF(MONTH, a.fecha_nacimiento, CURDATE()) < 3 AND (rb.peso_kg < 10.0 OR rb.consumo_alimento_diario < 0.5 OR rb.peso_kg > 35.0 OR rb.consumo_alimento_diario > 2.0)) OR
+                      (TIMESTAMPDIFF(MONTH, a.fecha_nacimiento, CURDATE()) BETWEEN 3 AND 8 AND (rb.peso_kg < 45.0 OR rb.consumo_alimento_diario < 1.5 OR rb.peso_kg > 130.0 OR rb.consumo_alimento_diario > 4.5)) OR
+                      (TIMESTAMPDIFF(MONTH, a.fecha_nacimiento, CURDATE()) > 8 AND (rb.peso_kg < 90.0 OR rb.consumo_alimento_diario < 2.0 OR rb.peso_kg > 350.0 OR rb.consumo_alimento_diario > 8.0))
+                  )) OR
+                  -- OVINO (id_especie = 3)
+                  (a.id_especie = 3 AND (
+                      (TIMESTAMPDIFF(MONTH, a.fecha_nacimiento, CURDATE()) < 6 AND (rb.peso_kg < 12.0 OR rb.consumo_alimento_diario < 0.4 OR rb.peso_kg > 40.0 OR rb.consumo_alimento_diario > 1.8)) OR
+                      (TIMESTAMPDIFF(MONTH, a.fecha_nacimiento, CURDATE()) >= 6 AND (rb.peso_kg < 30.0 OR rb.consumo_alimento_diario < 0.8 OR rb.peso_kg > 75.0 OR rb.consumo_alimento_diario > 3.0))
+                  ))
+              );
+        """
+        cursor.execute(query)
+        resultados = cursor.fetchall()
+        cursor.close()
+        return [fila[0] for fila in resultados]
+    except Exception as error:
+        print(f"Error al obtener códigos de alertas de producción: {error}")
+        return []
+    finally:
+        conexion.close()

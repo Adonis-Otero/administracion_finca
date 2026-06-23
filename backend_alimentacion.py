@@ -55,7 +55,7 @@ def calcular_totales_alimentacion_finca(costo_por_kg=0.5):
         conexion.close()
 
 def obtener_detalle_alimentacion_animales():
-    """Retorna la lista de animales activos con su especie, consumo diario y dieta asignada."""
+    """Retorna la lista de animales activos con su especie, consumo diario, dieta asignada, id_especie y fecha_nacimiento."""
     conexion = obtener_conexion()
     if not conexion: return []
     try:
@@ -64,7 +64,9 @@ def obtener_detalle_alimentacion_animales():
             SELECT a.id_animal, a.numero_identificacion, e.nombre AS especie,
                    COALESCE(rb.peso_kg, 0.0) AS peso_kg,
                    COALESCE(rb.consumo_alimento_diario, 0.0) AS consumo_alimento_diario,
-                   a.tipo_alimento
+                   a.tipo_alimento,
+                   a.id_especie,
+                   DATE_FORMAT(a.fecha_nacimiento, '%Y-%m-%d') AS fecha_nacimiento
             FROM animales a
             INNER JOIN especies e ON a.id_especie = e.id_especie
             LEFT JOIN registros_biometricos rb ON a.id_animal = rb.id_animal 
@@ -86,7 +88,9 @@ def obtener_detalle_alimentacion_animales():
             fila[2],
             float(fila[3]),
             float(fila[4]),
-            fila[5] if fila[5] else "Pasto Natural / Forraje"
+            fila[5] if fila[5] else "Pasto Natural / Forraje",
+            fila[6],
+            fila[7]
         ] for fila in resultados]
     except Exception as e:
         print(f"Error al obtener detalle de alimentacion: {e}")

@@ -2,18 +2,19 @@
 import reflex as rx
 import re
 import backend_animales
+from . import styles
 
 class AnimalesState(rx.State):
     """Gestor de Estado modular para la vista de Animales."""
     
     # --- Campos del Formulario de Registro ---
     numero_id: str = ""
-    especie_nombre: str = "Bovino"
+    especie_nombre: str = "🐄 Bovino"
     sexo: str = "F"
     fecha_nacimiento: str = ""
     peso_inicial: str = ""
     alimento_inicial: str = ""
-    mensaje_alerta: str = ""
+    registrando: bool = False
 
     # --- KPIs y Contadores ---
     total_animales: int = 0
@@ -22,10 +23,19 @@ class AnimalesState(rx.State):
     ovinos_count: int = 0
     alertas_sanitarias_count: int = 0
     alertas_produccion_count: int = 0
+    lista_alertas_sanitarias_codigos: list[str] = []
+    lista_alertas_produccion_codigos: list[str] = []
 
     # --- Inventario ---
     lista_completa_animales: list[list] = []
-    especie_filtro: str = "Todas"
+    especie_filtro: str = "📋 Todas"
+    busqueda: str = ""
+
+    # --- Modal de Confirmación de Baja ---
+    dialogo_baja_abierto: bool = False
+    baja_id_animal_pendiente: int = 0
+    baja_estado_pendiente: int = 0   # 2 = Muerte, 3 = Venta
+    baja_codigo_pendiente: str = ""
 
     async def cargar_datos(self):
         """Consulta los datos del backend en hilos secundarios para poblar la UI."""
@@ -42,9 +52,13 @@ class AnimalesState(rx.State):
         self.alertas_sanitarias_count = sanitarias
         self.alertas_produccion_count = produccion
         self.lista_completa_animales = dataset
+        self.lista_alertas_sanitarias_codigos = await rx.run_in_thread(backend_animales.obtener_codigos_alertas_sanitarias)
+        self.lista_alertas_produccion_codigos = await rx.run_in_thread(backend_animales.obtener_codigos_alertas_produccion)
 
     def cambiar_numero_id(self, valor: str):
-        self.numero_id = valor.upper()
+        """Acepta solo códigos alfanuméricos, guiones y guiones bajos. Máximo 20 caracteres."""
+        sanitizado = re.sub(r"[^A-Za-z0-9\-_]", "", valor).upper()
+        self.numero_id = sanitizado[:20]
 
     def cambiar_especie(self, valor: str):
         self.especie_nombre = valor
@@ -76,11 +90,32 @@ class AnimalesState(rx.State):
     def cambiar_filtro(self, valor: str):
         self.especie_filtro = valor
 
+    def cambiar_busqueda(self, valor: str):
+        self.busqueda = valor
+
     @rx.var
     def animales_filtrados(self) -> list[list]:
-        if self.especie_filtro == "Todas":
-            return self.lista_completa_animales
-        return [a for a in self.lista_completa_animales if len(a) > 2 and a[2] == self.especie_filtro]
+        filtro_limpio = self.especie_filtro.replace("📋 ", "").replace("🐄 ", "").replace("🐖 ", "").replace("🐑 ", "").replace("⚠️ ", "").strip()
+        if filtro_limpio == "Todas":
+            lista = self.lista_completa_animales
+        elif filtro_limpio == "Con Alertas":
+            lista = [
+                a for a in self.lista_completa_animales 
+                if len(a) > 1 and (
+                    a[1] in self.lista_alertas_sanitarias_codigos or 
+                    a[1] in self.lista_alertas_produccion_codigos
+                )
+            ]
+        else:
+            lista = [a for a in self.lista_completa_animales if len(a) > 2 and a[2] == filtro_limpio]
+            
+        if self.busqueda.strip() != "":
+            termino = self.busqueda.strip().lower()
+            lista = [
+                a for a in lista
+                if (termino in str(a[0]).lower()) or (termino in str(a[1]).lower())
+            ]
+        return lista
 
     # --- Semáforos de KPIs ---
     @rx.var
@@ -105,25 +140,59 @@ class AnimalesState(rx.State):
         """Registra un animal con su peso e ingesta de alimento inicial utilizando transacciones en el backend."""
         # Validación de campos
         if not self.numero_id or not self.fecha_nacimiento or not self.peso_inicial or not self.alimento_inicial:
-            self.mensaje_alerta = "Todos los campos son obligatorios para el registro inicial."
+            yield rx.toast.warning("Todos los campos son obligatorios para el registro inicial.")
             return
 
         # Evitar puntos flotantes inválidos
         if self.peso_inicial.endswith('.') or self.alimento_inicial.endswith('.'):
-            self.mensaje_alerta = "Por favor, complete los valores decimales."
+            yield rx.toast.warning("Por favor, complete los valores decimales.")
             return
 
+        # --- Validaciones de seguridad y formato ---
+        # Verificar que el código sea alfanumérico (sin caracteres especiales ni scripts)
+        if not re.match(r'^[A-Z0-9\-_]{2,20}$', self.numero_id):
+            yield rx.toast.warning("El código del animal solo admite letras, números, guiones y guiones bajos (2–20 car.)")
+            return
+
+        # Evitar iniciales cruzadas que causen confusión de especies
+        especie_limpia = self.especie_nombre.replace("🐄 ", "").replace("🐖 ", "").replace("🐑 ", "").strip()
+        codigo_upper = self.numero_id.upper()
+        if especie_limpia == "Bovino":
+            if "OVI" in codigo_upper or "POR" in codigo_upper:
+                yield rx.toast.warning("Para un Bovino, el código no puede contener iniciales de otras especies ('OVI' o 'POR').")
+                return
+        elif especie_limpia == "Porcino":
+            if "BOV" in codigo_upper or "OVI" in codigo_upper:
+                yield rx.toast.warning("Para un Porcino, el código no puede contener iniciales de otras especies ('BOV' o 'OVI').")
+                return
+        elif especie_limpia == "Ovino":
+            if "BOV" in codigo_upper or "POR" in codigo_upper:
+                yield rx.toast.warning("Para un Ovino, el código no puede contener iniciales de otras especies ('BOV' o 'POR').")
+                return
+
+        # Verificar rango sensato de valores numéricos (evitar valores absurdos)
         try:
             peso_val = float(self.peso_inicial)
             alimento_val = float(self.alimento_inicial)
-        except ValueError as val_err:
-            self.mensaje_alerta = f"Form Error (ValueError): Los valores de Peso o Alimento no son números válidos. Detalle: {str(val_err)}"
+        except ValueError:
+            yield rx.toast.error("Los valores de Peso o Alimento no son números válidos.")
             return
 
+        if not (1.0 <= peso_val <= 2000.0):
+            yield rx.toast.warning("El peso inicial debe estar entre 1 y 2,000 kg.")
+            return
+        if not (0.1 <= alimento_val <= 200.0):
+            yield rx.toast.warning("El consumo diario debe estar entre 0.1 y 200 kg/día.")
+            return
+
+        self.registrando = True
+        yield
+
+        especie_limpia = self.especie_nombre.replace("🐄 ", "").replace("🐖 ", "").replace("🐑 ", "").strip()
         def operacion_bd():
             return backend_animales.registrar_animal_completo(
                 self.numero_id.strip(),
-                self.especie_nombre,
+                especie_limpia,
                 self.sexo,
                 self.fecha_nacimiento,
                 peso_val,
@@ -132,19 +201,43 @@ class AnimalesState(rx.State):
 
         try:
             exito, msg = await rx.run_in_thread(operacion_bd)
-            self.mensaje_alerta = msg
             if exito:
+                yield rx.toast.success(msg)
                 self.numero_id = ""
                 self.fecha_nacimiento = ""
                 self.peso_inicial = ""
                 self.alimento_inicial = ""
                 await self.cargar_datos()
+                await self._actualizar_otros_estados()
+            else:
+                yield rx.toast.error(msg)
         except Exception as error:
             print(f"Error en registro: {error}")
-            self.mensaje_alerta = f"Frontend Exception (registrar_nuevo_animal): {str(error)}"
+            yield rx.toast.error(f"Error en registro: {str(error)}")
+        finally:
+            self.registrando = False
+            yield
 
-    async def dar_de_baja_animal(self, id_animal: int, estado: int):
-        """Actualiza el estado de un animal en la BD (Muerte o Venta) y actualiza la lista."""
+    def solicitar_baja_animal(self, id_animal: int, estado: int, codigo: str):
+        """Abre el diálogo de confirmación antes de ejecutar la baja."""
+        self.baja_id_animal_pendiente = id_animal
+        self.baja_estado_pendiente = estado
+        self.baja_codigo_pendiente = codigo
+        self.dialogo_baja_abierto = True
+
+    def cancelar_baja(self):
+        """Cierra el diálogo de confirmación sin realizar cambios."""
+        self.dialogo_baja_abierto = False
+        self.baja_id_animal_pendiente = 0
+        self.baja_estado_pendiente = 0
+        self.baja_codigo_pendiente = ""
+
+    async def confirmar_baja_animal(self):
+        """Ejecuta la baja del animal confirmada en el diálogo."""
+        self.dialogo_baja_abierto = False
+        id_animal = self.baja_id_animal_pendiente
+        estado = self.baja_estado_pendiente
+
         def operacion_bd():
             # 2: Muerto, 3: Vendido
             exito, msg = backend_animales.actualizar_estado_animal(id_animal, estado)
@@ -152,94 +245,67 @@ class AnimalesState(rx.State):
 
         exito, msg = await rx.run_in_thread(operacion_bd)
         if exito:
-            self.mensaje_alerta = f"¡Animal ID {id_animal} dado de baja exitosamente! (Respuesta: {msg})"
+            tipo = "fallecido" if estado == 2 else "vendido"
+            yield rx.toast.success(f"Animal {self.baja_codigo_pendiente} registrado como {tipo} exitosamente.")
+            self.baja_id_animal_pendiente = 0
+            self.baja_estado_pendiente = 0
+            self.baja_codigo_pendiente = ""
             await self.cargar_datos()
+            await self._actualizar_otros_estados()
         else:
-            self.mensaje_alerta = f"Fallo al dar de baja: {msg}"
+            yield rx.toast.error(f"Fallo al dar de baja: {msg}")
 
-    def limpiar_alerta(self):
-        self.mensaje_alerta = ""
+    async def _actualizar_otros_estados(self):
+        """Actualiza los datos en los otros gestores de estado modular."""
+        try:
+            from Administracion_Finca.views.vacunacion import VacunacionState
+            from Administracion_Finca.views.alimentacion import AlimentacionState
+            from Administracion_Finca.views.ia import IAState
+            
+            vac_state = await self.get_state(VacunacionState)
+            await vac_state.cargar_datos()
+            
+            alim_state = await self.get_state(AlimentacionState)
+            await alim_state.cargar_datos()
+            
+            ia_state = await self.get_state(IAState)
+            await ia_state.cargar_datos()
+        except Exception as e:
+            print(f"Error al actualizar otros estados desde AnimalesState: {e}")
 
 
-# --- Tokens de color semánticos (se adaptan a modo claro/oscuro) ---
-_card_bg   = rx.color_mode_cond(light="#ffffff",  dark="#1f2937")
-_card_border = rx.color_mode_cond(light="#e2e8f0", dark="#374151")
-_input_bg  = rx.color_mode_cond(light="#f8fafc",  dark="#374151")
-_text_main = rx.color_mode_cond(light="#0f172a",  dark="#ffffff")
-_text_muted = rx.color_mode_cond(light="#64748b", dark="#9ca3af")
-_text_sub  = rx.color_mode_cond(light="#475569",  dark="#e5e7eb")
-_text_accent = rx.color_mode_cond(light="#1d4ed8", dark="#60a5fa")
 
+# --- Tokens de color semánticos (importados de styles) ---
+_card_bg = styles.card_bg
+_card_border = styles.card_border
+_input_bg = styles.input_bg
+_text_main = styles.text_main
+_text_muted = styles.text_muted
+_text_sub = styles.text_sub
+_text_accent = styles.text_accent
 
-# --- Componentes Visuales ---
-
-def kpi_card(titulo: str, valor: str, estado: str, subtitulo: str) -> rx.Component:
-    """Tarjeta de KPI con diseño premium y semáforos integrados."""
-    color_border = rx.cond(estado == "verde", "#22c55e", rx.cond(estado == "amarillo", "#fbbf24", "#ef4444"))
-    color_bg = rx.cond(
-        estado == "verde",
-        rx.color_mode_cond(light="#dcfce7", dark="#064e3b"),
-        rx.cond(
-            estado == "amarillo",
-            rx.color_mode_cond(light="#fef9c3", dark="#78350f"),
-            rx.color_mode_cond(light="#fee2e2", dark="#7f1d1d")
-        )
-    )
-    color_heading = rx.cond(
-        estado == "verde",
-        rx.color_mode_cond(light="#15803d", dark="#ffffff"),
-        rx.cond(
-            estado == "amarillo",
-            rx.color_mode_cond(light="#92400e", dark="#ffffff"),
-            rx.color_mode_cond(light="#991b1b", dark="#ffffff")
-        )
-    )
-    color_sub = rx.cond(
-        estado == "verde",
-        rx.color_mode_cond(light="#166534", dark="#d1d5db"),
-        rx.cond(
-            estado == "amarillo",
-            rx.color_mode_cond(light="#78350f", dark="#d1d5db"),
-            rx.color_mode_cond(light="#7f1d1d", dark="#d1d5db")
-        )
-    )
-    color_title = rx.cond(
-        estado == "verde",
-        rx.color_mode_cond(light="#15803d", dark="#9ca3af"),
-        rx.cond(
-            estado == "amarillo",
-            rx.color_mode_cond(light="#92400e", dark="#9ca3af"),
-            rx.color_mode_cond(light="#991b1b", dark="#9ca3af")
-        )
-    )
-
-    return rx.card(
-        rx.vstack(
-            rx.hstack(
-                rx.cond(estado == "verde", rx.icon("circle-check", color="#4ade80", size=20)),
-                rx.cond(estado == "amarillo", rx.icon("triangle-alert", color="#fbbf24", size=20)),
-                rx.cond(estado == "rojo", rx.icon("circle-alert", color="#f87171", size=20)),
-                rx.text(titulo, font_size="0.95em", weight="bold", color=color_title),
-                spacing="2", align="center",
-            ),
-            rx.heading(valor, size="6", margin_y="4px", color=color_heading),
-            rx.text(subtitulo, font_size="0.75em", color=color_sub),
-            align="start", spacing="1"
-        ),
-        border_left=f"5px solid {color_border}",
-        background_color=color_bg,
-        border_radius="lg",
-        box_shadow="lg",
-        padding="16px",
-        width="100%",
-    )
+from .styles import kpi_card
 
 
 def elemento_tabla_animal(animal: rx.Var[list]) -> rx.Component:
     """Fila para cada animal en la tabla de inventario general."""
     return rx.table.row(
         rx.table.cell(animal[0].to_string(), color=_text_muted),
-        rx.table.cell(animal[1], font_weight="bold", color=_text_main),
+        rx.table.cell(
+            rx.hstack(
+                rx.text(animal[1], font_weight="bold", color=_text_main),
+                rx.cond(
+                    AnimalesState.lista_alertas_sanitarias_codigos.contains(animal[1]),
+                    rx.badge("⚕️ Sanitaria", color_scheme="red", variant="solid")
+                ),
+                rx.cond(
+                    AnimalesState.lista_alertas_produccion_codigos.contains(animal[1]),
+                    rx.badge("⚠️ Alerta", color_scheme="amber", variant="solid")
+                ),
+                spacing="2",
+                align="center"
+            )
+        ),
         rx.table.cell(animal[2], color=_text_sub),
         rx.table.cell(
             rx.badge(
@@ -254,19 +320,33 @@ def elemento_tabla_animal(animal: rx.Var[list]) -> rx.Component:
         rx.table.cell(animal[3], color=_text_muted),
         rx.table.cell(
             rx.hstack(
-                rx.button(
-                    "Muerte",
-                    on_click=lambda: AnimalesState.dar_de_baja_animal(animal[0].to(int), 2),
-                    color_scheme="red",
-                    size="1",
-                    variant="solid"
+                rx.tooltip(
+                    rx.button(
+                        rx.icon("skull", size=13),
+                        "Muerte",
+                        on_click=lambda: AnimalesState.solicitar_baja_animal(
+                            animal[0].to(int), 2, animal[1].to(str)
+                        ),
+                        color_scheme="red",
+                        size="1",
+                        variant="solid",
+                        cursor="pointer",
+                    ),
+                    content="Registrar como fallecido",
                 ),
-                rx.button(
-                    "Venta",
-                    on_click=lambda: AnimalesState.dar_de_baja_animal(animal[0].to(int), 3),
-                    color_scheme="orange",
-                    size="1",
-                    variant="solid"
+                rx.tooltip(
+                    rx.button(
+                        rx.icon("badge-dollar-sign", size=13),
+                        "Venta",
+                        on_click=lambda: AnimalesState.solicitar_baja_animal(
+                            animal[0].to(int), 3, animal[1].to(str)
+                        ),
+                        color_scheme="orange",
+                        size="1",
+                        variant="solid",
+                        cursor="pointer",
+                    ),
+                    content="Registrar como vendido",
                 ),
                 spacing="2"
             )
@@ -280,39 +360,67 @@ def animales_view() -> rx.Component:
         # --- Cabecera de KPIs ---
         rx.heading("Control de Inventario y KPIs Sanitarios", size="4", color=_text_main, margin_top="10px"),
         rx.grid(
-            kpi_card("Inventario Activo", AnimalesState.total_animales.to_string(), AnimalesState.semaforo_inventario, "Total cabezas activas"),
-            kpi_card("Alertas Sanitarias", AnimalesState.alertas_sanitarias_count.to_string(), AnimalesState.semaforo_sanitario, "Control vacunas vencido"),
-            kpi_card("Alertas Producción", AnimalesState.alertas_produccion_count.to_string(), AnimalesState.semaforo_produccion, "Por debajo del umbral"),
-            columns="3",
+            kpi_card("Inventario Activo", AnimalesState.total_animales.to_string(), estado=AnimalesState.semaforo_inventario, subtitulo="Total cabezas activas"),
+            kpi_card(
+                "Alertas Sanitarias", 
+                AnimalesState.alertas_sanitarias_count.to_string(), 
+                estado=AnimalesState.semaforo_sanitario, 
+                subtitulo="Control vacunas vencido",
+                popover_content=rx.cond(
+                    AnimalesState.alertas_sanitarias_count > 0,
+                    rx.vstack(
+                        rx.text("Animales con dosis vencida:", font_size="0.8em", weight="bold", color=_text_main),
+                        rx.flex(
+                            rx.foreach(
+                                AnimalesState.lista_alertas_sanitarias_codigos,
+                                lambda c: rx.badge(c, color_scheme="red", variant="solid", margin="2px")
+                            ),
+                            flex_wrap="wrap",
+                            max_width="200px"
+                        ),
+                        spacing="2",
+                        align="start",
+                        padding="8px"
+                    ),
+                    rx.text("No hay alertas activas", font_size="0.8em", color=_text_muted, padding="8px")
+                )
+            ),
+            kpi_card(
+                "Alertas Producción", 
+                AnimalesState.alertas_produccion_count.to_string(), 
+                estado=AnimalesState.semaforo_produccion, 
+                subtitulo="Fuera del rango esperado",
+                popover_content=rx.cond(
+                    AnimalesState.alertas_produccion_count > 0,
+                    rx.vstack(
+                        rx.text("Animales fuera de rango:", font_size="0.8em", weight="bold", color=_text_main),
+                        rx.flex(
+                            rx.foreach(
+                                AnimalesState.lista_alertas_produccion_codigos,
+                                lambda c: rx.badge(c, color_scheme="amber", variant="solid", margin="2px")
+                            ),
+                            flex_wrap="wrap",
+                            max_width="200px"
+                        ),
+                        spacing="2",
+                        align="start",
+                        padding="8px"
+                    ),
+                    rx.text("No hay alertas activas", font_size="0.8em", color=_text_muted, padding="8px")
+                )
+            ),
+            columns={"base": "1", "sm": "3"},
             spacing="4",
             width="100%",
             margin_bottom="10px"
         ),
 
-        # --- Distribución de Especies ---
-        rx.card(
-            rx.vstack(
-                rx.text("Distribución de Rebaño Activo", weight="bold", font_size="0.9em", color=_text_sub),
-                rx.hstack(
-                    rx.badge(f"Bovinos: {AnimalesState.bovinos_count}", color_scheme="blue", variant="solid", size="2"),
-                    rx.badge(f"Porcinos: {AnimalesState.porcinos_count}", color_scheme="orange", variant="solid", size="2"),
-                    rx.badge(f"Ovinos: {AnimalesState.ovinos_count}", color_scheme="green", variant="solid", size="2"),
-                    spacing="3",
-                ),
-                align="start", spacing="2"
-            ),
-            width="100%",
-            background_color=_card_bg,
-            border=rx.color_mode_cond(light="1px solid #e2e8f0", dark="1px solid #374151"),
-            margin_bottom="15px"
-        ),
-
         # --- Sección Principal de Trabajo (Registro y Tabla) ---
-        rx.hstack(
+        rx.flex(
             # Columna izquierda: Registro de ejemplar
             rx.card(
                 rx.vstack(
-                    rx.heading("Alta Única de Semovientes", size="3", color=_text_main),
+                    rx.heading("Alta Única de Animales", size="3", color=_text_main),
                     rx.text("Inicialización completa con métricas biométricas", font_size="0.8em", color=_text_muted),
 
                     rx.text("Código Identificación Único", weight="bold", font_size="0.85em", color=_text_sub),
@@ -322,12 +430,13 @@ def animales_view() -> rx.Component:
                         on_change=AnimalesState.cambiar_numero_id,
                         width="100%",
                         background_color=_input_bg,
+                        max_length=20,
                     ),
 
                     rx.hstack(
                         rx.vstack(
                             rx.text("Especie", weight="bold", font_size="0.85em", color=_text_sub),
-                            rx.select(["Bovino", "Porcino", "Ovino"], value=AnimalesState.especie_nombre, on_change=AnimalesState.cambiar_especie, width="100%"),
+                            rx.select(["🐄 Bovino", "🐖 Porcino", "🐑 Ovino"], value=AnimalesState.especie_nombre, on_change=AnimalesState.cambiar_especie, width="100%"),
                             align_items="start", width="50%"
                         ),
                         rx.vstack(
@@ -366,14 +475,15 @@ def animales_view() -> rx.Component:
                         on_click=AnimalesState.registrar_nuevo_animal,
                         color_scheme="green",
                         width="100%",
-                        margin_top="10px"
+                        margin_top="10px",
+                        loading=AnimalesState.registrando,
                     ),
                     spacing="3",
                     align_items="start",
                 ),
                 background_color=_card_bg,
                 border=rx.color_mode_cond(light="1px solid #e2e8f0", dark="1px solid #374151"),
-                width="380px",
+                width={"base": "100%", "lg": "380px"},
                 padding="20px",
             ),
 
@@ -383,8 +493,24 @@ def animales_view() -> rx.Component:
                     rx.hstack(
                         rx.heading("Inventario Activo", size="3", color=_text_main),
                         rx.spacer(),
+                        rx.hstack(
+                            rx.badge("🐄 ", AnimalesState.bovinos_count, color_scheme="blue", variant="soft", size="1"),
+                            rx.badge("🐖 ", AnimalesState.porcinos_count, color_scheme="orange", variant="soft", size="1"),
+                            rx.badge("🐑 ", AnimalesState.ovinos_count, color_scheme="green", variant="soft", size="1"),
+                            spacing="2",
+                            display=["none", "flex", "flex"],
+                        ),
+                        rx.spacer(),
+                        rx.input(
+                            placeholder="Buscar...",
+                            value=AnimalesState.busqueda,
+                            on_change=AnimalesState.cambiar_busqueda,
+                            size="1",
+                            width="160px",
+                            background_color=_input_bg,
+                        ),
                         rx.select(
-                            ["Todas", "Bovino", "Porcino", "Ovino"],
+                            ["📋 Todas", "🐄 Bovino", "🐖 Porcino", "🐑 Ovino", "⚠️ Con Alertas"],
                             value=AnimalesState.especie_filtro,
                             on_change=AnimalesState.cambiar_filtro,
                             size="1"
@@ -394,60 +520,165 @@ def animales_view() -> rx.Component:
                     ),
                     rx.text("Manejo zootécnico y control de bajas en tiempo real", font_size="0.8em", color=_text_muted, margin_bottom="10px"),
 
-                    rx.table.root(
-                        rx.table.header(
-                            rx.table.row(
-                                rx.table.column_header_cell("ID", color=_text_muted),
-                                rx.table.column_header_cell("Código", color=_text_muted),
-                                rx.table.column_header_cell("Especie", color=_text_muted),
-                                rx.table.column_header_cell("Sexo", color=_text_muted),
-                                rx.table.column_header_cell("Categoría", color=_text_muted),
-                                rx.table.column_header_cell("Nacimiento", color=_text_muted),
-                                rx.table.column_header_cell("Dar de Baja", color=_text_muted),
-                            )
+                    rx.cond(
+                        AnimalesState.animales_filtrados.length() == 0,
+                        # --- Estado Vacío ---
+                        rx.center(
+                            rx.vstack(
+                                rx.icon(
+                                    "search-x",
+                                    size=48,
+                                    color=rx.color_mode_cond(light="#cbd5e1", dark="#4b5563"),
+                                ),
+                                rx.text(
+                                    "Sin animales activos",
+                                    font_size="1.05em",
+                                    weight="bold",
+                                    color=_text_muted,
+                                ),
+                                rx.text(
+                                    "Registra el primer animal usando el formulario de la izquierda.",
+                                    font_size="0.82em",
+                                    color=_text_muted,
+                                    text_align="center",
+                                    max_width="260px",
+                                ),
+                                spacing="2",
+                                align="center",
+                                padding_y="40px",
+                            ),
+                            width="100%",
                         ),
-                        rx.table.body(
-                            rx.foreach(
-                                AnimalesState.animales_filtrados,
-                                elemento_tabla_animal
-                            )
+                        # --- Tabla Normal ---
+                        rx.box(
+                            rx.table.root(
+                                rx.table.header(
+                                    rx.table.row(
+                                        rx.table.column_header_cell("ID", color=_text_muted),
+                                        rx.table.column_header_cell("Código", color=_text_muted),
+                                        rx.table.column_header_cell("Especie", color=_text_muted),
+                                        rx.table.column_header_cell("Sexo", color=_text_muted),
+                                        rx.table.column_header_cell("Categoría", color=_text_muted),
+                                        rx.table.column_header_cell("Nacimiento", color=_text_muted),
+                                        rx.table.column_header_cell("Dar de Baja", color=_text_muted),
+                                    )
+                                ),
+                                rx.table.body(
+                                    rx.foreach(
+                                        AnimalesState.animales_filtrados,
+                                        elemento_tabla_animal
+                                    )
+                                ),
+                                width="100%",
+                                variant="surface",
+                            ),
+                            overflow_x="auto",
+                            width="100%",
                         ),
-                        width="100%",
-                        variant="surface",
                     ),
                     width="100%",
                 ),
                 background_color=_card_bg,
                 border=rx.color_mode_cond(light="1px solid #e2e8f0", dark="1px solid #374151"),
                 flex="1",
+                width="100%",
                 padding="20px",
             ),
             width="100%",
             align_items="start",
             spacing="4",
+            direction={"base": "column", "lg": "row"},
         ),
 
-        # --- Alertas y Callouts ---
-        rx.cond(
-            AnimalesState.mensaje_alerta != "",
-            rx.hstack(
-                rx.callout(
-                    AnimalesState.mensaje_alerta,
-                    icon="info",
-                    color_scheme="blue",
-                    flex="1"
+        # --- Modal de Confirmación de Baja ---
+        rx.alert_dialog.root(
+            rx.alert_dialog.content(
+                rx.alert_dialog.title(
+                    rx.hstack(
+                        rx.cond(
+                            AnimalesState.baja_estado_pendiente == 2,
+                            rx.icon("skull", color="#ef4444", size=20),
+                            rx.icon("badge-dollar-sign", color="#f97316", size=20),
+                        ),
+                        rx.text(
+                            rx.cond(
+                                AnimalesState.baja_estado_pendiente == 2,
+                                "Confirmar Baja por Fallecimiento",
+                                "Confirmar Baja por Venta",
+                            )
+                        ),
+                        spacing="2",
+                        align="center",
+                    )
                 ),
-                rx.button(
-                    rx.icon("x"),
-                    on_click=AnimalesState.limpiar_alerta,
-                    color_scheme="gray",
-                    variant="soft"
+                rx.alert_dialog.description(
+                    rx.vstack(
+                        rx.text(
+                            "Estás a punto de dar de baja al animal ",
+                            rx.text.strong(AnimalesState.baja_codigo_pendiente),
+                            ". Esta acción lo removerá del inventario activo.",
+                            font_size="0.9em",
+                            color=_text_sub,
+                        ),
+                        rx.callout.root(
+                            rx.callout.icon(rx.icon("triangle-alert", size=16)),
+                            rx.callout.text(
+                                "Esta operación no puede deshacerse. El animal dejará de aparecer en los módulos de Vacunación y Alimentación.",
+                                font_size="0.82em",
+                            ),
+                            color=rx.cond(
+                                AnimalesState.baja_estado_pendiente == 2,
+                                "red",
+                                "orange",
+                            ),
+                            variant="soft",
+                            margin_top="10px",
+                        ),
+                        spacing="2",
+                        align="start",
+                    )
                 ),
-                width="100%",
-                align_items="center",
-                spacing="2"
-            )
+                rx.flex(
+                    rx.alert_dialog.cancel(
+                        rx.button(
+                            rx.icon("x", size=15),
+                            "Cancelar",
+                            variant="soft",
+                            color_scheme="gray",
+                            on_click=AnimalesState.cancelar_baja,
+                            cursor="pointer",
+                        )
+                    ),
+                    rx.alert_dialog.action(
+                        rx.button(
+                            rx.cond(
+                                AnimalesState.baja_estado_pendiente == 2,
+                                rx.icon("skull", size=15),
+                                rx.icon("badge-dollar-sign", size=15),
+                            ),
+                            rx.cond(
+                                AnimalesState.baja_estado_pendiente == 2,
+                                "Confirmar Fallecimiento",
+                                "Confirmar Venta",
+                            ),
+                            color_scheme=rx.cond(
+                                AnimalesState.baja_estado_pendiente == 2,
+                                "red",
+                                "orange",
+                            ),
+                            on_click=AnimalesState.confirmar_baja_animal,
+                            cursor="pointer",
+                        )
+                    ),
+                    spacing="3",
+                    margin_top="16px",
+                    justify="end",
+                ),
+                max_width="480px",
+            ),
+            open=AnimalesState.dialogo_baja_abierto,
         ),
+
         spacing="4",
         width="100%"
     )
